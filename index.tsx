@@ -3,15 +3,30 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import {GoogleGenAI} from '@google/genai';
+import {GoogleGenAI, Modality} from '@google/genai';
 import {marked} from 'marked';
 
-const ai = new GoogleGenAI({apiKey: process.env.API_KEY});
+const ai = new GoogleGenAI({apiKey: process.env.GEMINI_API_KEY});
+
+const chat = ai.chats.create({
+  model: 'gemini-2.0-flash-preview-image-generation',
+  config: {
+    responseModalities: [Modality.TEXT, Modality.IMAGE],
+  },
+  history: [],
+});
 
 const userInput = document.querySelector('#input') as HTMLTextAreaElement;
 const modelOutput = document.querySelector('#output') as HTMLDivElement;
 const slideshow = document.querySelector('#slideshow') as HTMLDivElement;
 const error = document.querySelector('#error') as HTMLDivElement;
+
+const additionalInstructions = `
+Use a fun story about lots of tiny cats as a metaphor.
+Keep sentences short but conversational, casual, and engaging.
+Generate a cute, minimal illustration for each sentence with black ink on white background.
+No commentary, just begin your explanation.
+Keep going until you're done.`;
 
 async function addSlide(text: string, image: HTMLImageElement) {
   const slide = document.createElement('div');
@@ -23,8 +38,22 @@ async function addSlide(text: string, image: HTMLImageElement) {
   slideshow.append(slide);
 }
 
+function parseError(error: string) {
+  const regex = /{"error":(.*)}/gm;
+  const m = regex.exec(error);
+  try {
+    const e = m[1];
+    const err = JSON.parse(e);
+    return err.message;
+  } catch (e) {
+    return error;
+  }
+}
+
 async function generate(message: string) {
   userInput.disabled = true;
+
+  chat.history.length = 0;
   modelOutput.innerHTML = '';
   slideshow.innerHTML = '';
   error.innerHTML = '';
@@ -37,63 +66,52 @@ async function generate(message: string) {
     modelOutput.append(userTurn);
     userInput.value = '';
 
-    const storyPlanPrompt = `You are a storyteller. Explain the following topic using a fun story about lots of tiny cats as a metaphor: "${message}".
-
-Break the story into short, conversational, and engaging sentences. For each sentence, create a prompt for an image generator to create a cute, minimal illustration with black ink on a white background.
-
-Respond with a JSON array of objects, where each object has a "sentence" and an "image_prompt" property. Only output the JSON.`;
-
-    const storyResponse = await ai.models.generateContent({
-      model: 'gemini-2.5-flash-preview-04-17',
-      contents: storyPlanPrompt,
-      config: {
-        responseMimeType: 'application/json',
-      },
+    const result = await chat.sendMessageStream({
+      message: message + additionalInstructions,
     });
 
-    let jsonStr = storyResponse.text.trim();
-    const fenceRegex = /^```(\w*)?\s*\n?(.*?)\n?\s*```$/s;
-    const match = jsonStr.match(fenceRegex);
-    if (match && match[2]) {
-      jsonStr = match[2].trim();
-    }
+    let text = '';
+    let img = null;
 
-    const storyPlan = JSON.parse(jsonStr);
-
-    if (!Array.isArray(storyPlan) || storyPlan.length === 0) {
-      throw new Error('Could not generate a story. Please try another topic.');
-    }
-
-    slideshow.removeAttribute('hidden');
-
-    for (const part of storyPlan) {
-      if (part.sentence && part.image_prompt) {
-        const imageResponse = await ai.models.generateImages({
-          model: 'imagen-3.0-generate-002',
-          prompt: part.image_prompt,
-          config: {numberOfImages: 1, outputMimeType: 'image/jpeg'},
-        });
-
-        const base64ImageBytes =
-          imageResponse.generatedImages[0].image.imageBytes;
-        const imageUrl = `data:image/jpeg;base64,${base64ImageBytes}`;
-        const img = document.createElement('img');
-        img.src = imageUrl;
-
-        await addSlide(part.sentence, img);
+    for await (const chunk of result) {
+      for (const candidate of chunk.candidates) {
+        for (const part of candidate.content.parts ?? []) {
+          if (part.text) {
+            text += part.text;
+          } else {
+            try {
+              const data = part.inlineData;
+              if (data) {
+                img = document.createElement('img');
+                img.src = `data:image/png;base64,` + data.data;
+              } else {
+                console.log('no data', chunk);
+              }
+            } catch (e) {
+              console.log('no data', chunk);
+            }
+          }
+          if (text && img) {
+            await addSlide(text, img);
+            slideshow.removeAttribute('hidden');
+            text = '';
+            img = null;
+          }
+        }
       }
     }
+    if (img) {
+      await addSlide(text, img);
+      slideshow.removeAttribute('hidden');
+      text = '';
+    }
   } catch (e) {
-    console.error(e);
-    const msg = e.message
-      ? e.message.replace(/\[GoogleGenerativeAI Error\]\s*/, '')
-      : 'An unknown error occurred. The model might not have been able to generate content for this topic.';
+    const msg = parseError(e);
     error.innerHTML = `Something went wrong: ${msg}`;
     error.removeAttribute('hidden');
-  } finally {
-    userInput.disabled = false;
-    userInput.focus();
   }
+  userInput.disabled = false;
+  userInput.focus();
 }
 
 userInput.addEventListener('keydown', async (e: KeyboardEvent) => {
